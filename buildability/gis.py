@@ -99,23 +99,46 @@ def detect_elev_field():
             return fields[c]
     return None
 
-def contours_inside(parcel_geom, elev_field=None):
-    """Fetch all contour lines intersecting the parcel.
-       Only request Shape_Length and (optionally) the elevation field."""
-    out_fields = "Shape_Length"
-    if elev_field:
-        out_fields += f",{elev_field}"
-    js = gget(CONTOUR_LAYER + "/query",
-              where="1=1",
-              outFields=out_fields,
-              returnGeometry="false",
-              geometry=json.dumps(parcel_geom),
-              geometryType="esriGeometryPolygon",
-              spatialRel="esriSpatialRelIntersects",
-              inSR=SR, outSR=SR,
-              resultRecordCount=2000)
-    return js.get("features", [])
+M2_TO_FT2 = 10.7639
+M_TO_FT = 3.28084
 
+def _polyline_length_m(geom: dict) -> float:
+    total = 0.0
+    # geometry: {"paths": [[[x1,y1],[x2,y2],...], [...]]}
+    paths = (geom or {}).get("paths") or []
+    for path in paths:
+        for i in range(len(path) - 1):
+            x1, y1 = path[i]
+            x2, y2 = path[i + 1]
+            total += math.hypot(x2 - x1, y2 - y1)
+    return total
+
+def contours_inside(parcel_geom: dict, layer_url: str, elev_field: str = None):
+    """
+    Return (features, total_len_m).
+    We intentionally use returnGeometry=true and compute length from geometry
+    so we don't depend on Shape_Length field naming.
+    """
+    params = {
+        "where": "1=1" if not elev_field else f"{elev_field} IS NOT NULL",
+        "outFields": "*" if elev_field else "OBJECTID",   # bring attrs if we need elevation
+        "returnGeometry": "true",
+        "geometry": json.dumps(parcel_geom),
+        "geometryType": "esriGeometryPolygon",
+        "spatialRel": "esriSpatialRelIntersects",
+        "inSR": SR,
+        "outSR": SR,
+        "resultRecordCount": 2000,
+    }
+    js = arcgis_get(layer_url + "/query", params)
+    feats = js.get("features", [])
+
+    total_len_m = 0.0
+    for f in feats:
+        g = f.get("geometry")
+        total_len_m += _polyline_length_m(g)
+
+    return feats, total_len_m
 def two_ft_subset(features, elev_field):
     if not features or not elev_field:
         return features or []

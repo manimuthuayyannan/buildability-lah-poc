@@ -1,15 +1,15 @@
 from .config import ACRES_PER_FT2
 
-def average_slope_percent_lah(total_contour_length_ft, contour_interval_ft, parcel_area_ft2):
-    """Official LAH average slope:
-        S(%) = 0.0023 * I(ft) * L(ft) / A(acres)
+
+def average_slope_percent_lah(total_contour_len_ft: float, contour_interval_ft: float, parcel_area_ft2: float):
     """
-    if not parcel_area_ft2 or parcel_area_ft2 <= 0:
+    Classic contour method:
+    Avg Slope (%) = (Σ L × I × 100) / (A × 2)  --> with ΣL being total contour length (ft),
+    I = contour interval (ft), A = area (ft²).
+    """
+    if not total_contour_len_ft or total_contour_len_ft <= 0 or not parcel_area_ft2 or parcel_area_ft2 <= 0:
         return None
-    a_acres = parcel_area_ft2 * ACRES_PER_FT2
-    if a_acres <= 0:
-        return None
-    return round(0.0023 * contour_interval_ft * total_contour_length_ft / a_acres, 2)
+    return (total_contour_len_ft * contour_interval_ft * 100.0) / (parcel_area_ft2 * 2.0)
 
 def lot_unit_factor(area_acres, avg_slope_pct):
     if not area_acres or area_acres <= 0 or avg_slope_pct is None:

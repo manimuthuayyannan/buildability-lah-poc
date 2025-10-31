@@ -31,18 +31,39 @@ def compute_summary(apn, geom, attrs, address=None, skip_dem=True, verbose=False
     elev_field = detect_elev_field() or "ELEVATION"
     feats = contours_inside(geom, elev_field=elev_field, index_only=False)
     feats_ft = project_polylines_to_measure(feats)
-    inside_len_ft, diag = length_inside_parcel_ft(feats_ft, geom, max_seg_len_ft=2.0)
+    inside_len_ft_raw, diag = length_inside_parcel_ft(feats_ft, geom, max_seg_len_ft=2.0)
 
-    # If nothing found, it’s almost always an “on-boundary” geometry quirk.
-    if inside_len_ft <= 0.0 and verbose:
+    if inside_len_ft_raw <= 0.0 and verbose:
         print("[CLI] WARNING: zero contour length inside parcel after robust clip.")
 
-    # --- choose contour interval: 5 ft if any INTERMEDIATE present, else 10 ft ---
+    # --- detect which set we actually measured on (5-ft vs 10-ft) ---
+    # We treat presence of INTERMEDIATE as "5-ft set available".
     layers = { (f["attributes"].get("LAYER","") or "").upper() for f in feats }
-    interval_used_ft = 5.0 if "INTERMEDIATE" in layers else 10.0
+    measured_interval_ft = 5.0 if "INTERMEDIATE" in layers else 10.0
 
-    # --- worksheet math ---
-    avg_slope = average_slope_percent_lah(inside_len_ft, interval_used_ft, area_acres)
+    # --- STEP 1: provisional slope using the measured interval ---
+    area_ft2 = parcel_area_ft2(geom)
+    area_acres = area_ft2 * ACRES_PER_FT2
+
+    S_prov = average_slope_percent_lah(inside_len_ft_raw, measured_interval_ft, area_acres)
+
+    # --- STEP 2: apply LAH rule for contour interval ---
+    # If S_prov <= 10%, LAH requires 2-ft contours.
+    # We approximate L at 2-ft by scaling from the measured set.
+    interval_used_ft = measured_interval_ft
+    inside_len_ft_used = inside_len_ft_raw
+    interval_source = "measured"
+
+    if S_prov <= 10.0:
+        interval_used_ft = 2.0
+        # scale L to equivalent 2-ft length
+        # L2 ≈ L_measured * (measured_interval / 2.0)
+        scale = measured_interval_ft / 2.0
+        inside_len_ft_used = inside_len_ft_raw * scale
+        interval_source = f"scaled_from_{int(measured_interval_ft)}ft"
+
+    # --- worksheet math with the final (LAH-compliant) interval ---
+    avg_slope = average_slope_percent_lah(inside_len_ft_used, interval_used_ft, area_acres)
     luf = lot_unit_factor(area_acres, avg_slope)
     mda_ft2, mfa_ft2, requires_cdp = mda_mfa_from_luf(avg_slope, luf)
 
@@ -57,15 +78,22 @@ def compute_summary(apn, geom, attrs, address=None, skip_dem=True, verbose=False
         "parcel_area_acres": round(area_acres, 4),
         "contour_elevation_field": elev_field,
         "contour_count": len(feats),
-        "contour_total_length_ft": round(inside_len_ft, 1),
+
+        # lengths reported both ways for transparency
+        "contour_total_length_ft_measured": round(inside_len_ft_raw, 1),
+        "contour_total_length_ft": round(inside_len_ft_used, 1),   # the length used for S
         "avg_slope_percent_LAH": round(avg_slope, 1),
+
         "lot_unit_factor": round(luf, 6),
         "mda_ft2": round(mda_ft2, 1) if mda_ft2 is not None else None,
         "mfa_ft2": round(mfa_ft2, 1) if mfa_ft2 is not None else None,
         "requires_cdp": requires_cdp,
         "slope_percent_dem_QA_mean": slope_dem["mean"],
+
         "notes": {
-            "contour_interval_ft_used": interval_used_ft,
+            "interval_measured_ft": measured_interval_ft,
+            "interval_used_ft": interval_used_ft,
+            "interval_source": interval_source,   # "measured" or "scaled_from_5ft/10ft"
             "diagnostics": diag,
         },
     }

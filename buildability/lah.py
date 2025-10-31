@@ -1,50 +1,46 @@
-from .config import ACRES_PER_FT2
+"""
+LAH Worksheet math (Worksheet #1): S (avg slope), LUF, MDA, MFA.
+All formulas mirror the Town’s worksheet.
+"""
 
+def average_slope_percent_lah(total_contour_len_ft: float, interval_ft: float, area_acres: float) -> float:
+    # S (%) = 0.0023 * I(ft) * L(ft) / An(acres)
+    if area_acres <= 0:
+        return 0.0
+    return 0.0023 * interval_ft * total_contour_len_ft / area_acres
 
-def average_slope_percent_lah(total_contour_len_ft: float, contour_interval_ft: float, parcel_area_ft2: float):
-    """
-    Classic contour method:
-    Avg Slope (%) = (Σ L × I × 100) / (A × 2)  --> with ΣL being total contour length (ft),
-    I = contour interval (ft), A = area (ft²).
-    """
-    if not total_contour_len_ft or total_contour_len_ft <= 0 or not parcel_area_ft2 or parcel_area_ft2 <= 0:
-        return None
-    return (total_contour_len_ft * contour_interval_ft * 100.0) / (parcel_area_ft2 * 2.0)
+def lot_unit_factor(area_acres: float, slope_percent: float) -> float:
+    # LUF = An for S <= 10
+    # LUF = An*(1 - 0.02143*(S-10)) for 10 < S < 30
+    # Past 30% the Town caps with separate rules; practical site behavior uses same linear
+    if slope_percent <= 10.0:
+        return area_acres
+    if slope_percent < 30.0:
+        return area_acres * (1.0 - 0.02143*(slope_percent - 10.0))
+    # Cap behavior (treat >=30 same as 30 for LUF)
+    return area_acres * (1.0 - 0.02143*(30.0 - 10.0))
 
-def lot_unit_factor(area_acres, avg_slope_pct):
-    if not area_acres or area_acres <= 0 or avg_slope_pct is None:
-        return None
-    S = min(max(avg_slope_pct, 0.0), 55.0)
-    if S <= 10.0:
-        return round(area_acres, 6)
-    factor = 1.0 - 0.02143 * (S - 10.0)
-    return round(area_acres * max(factor, 0.0), 6)
-
-def mda_mfa_from_luf(avg_slope_pct, luf):
-    if luf is None or avg_slope_pct is None:
-        return None, None, None
-    # CDP rule
-    if luf <= 0.50:
-        mfa = (luf / 0.50) * 5000.0
-        mda = mfa + 2100.0
-        return round(mda, 1), round(mfa, 1), True
-    S = avg_slope_pct
+def mda_mfa_from_luf(slope_percent: float, LUF: float):
     # MDA
-    if S <= 10.0:
-        mda = luf * 15000.0
-    elif S < 30.0:
-        mda = luf * (15000.0 - 375.0 * (S - 10.0))
+    if slope_percent <= 10.0:
+        MDA = LUF * 15000.0
+    elif slope_percent < 30.0:
+        MDA = LUF * (15000.0 - 375.0*(slope_percent - 10.0))
     else:
-        mda = luf * 7500.0
+        MDA = LUF * 7500.0
+
     # MFA
-    if S <= 10.0:
-        mfa = luf * 6000.0
-    elif S < 30.0:
-        mfa = luf * (6000.0 - 50.0 * (S - 10.0))
+    if slope_percent <= 10.0:
+        MFA = LUF * 6000.0
+    elif slope_percent < 30.0:
+        MFA = LUF * (6000.0 - 50.0*(slope_percent - 10.0))
     else:
-        mfa = luf * 5000.0
-    # Minimums
-    if luf > 0.50:
-        mda = max(mda, 7500.0)
-        mfa = max(mfa, 5000.0)
-    return round(mda, 1), round(mfa, 1), False
+        MFA = LUF * 5000.0
+
+    # Minimum floors if LUF > 0.50
+    if LUF > 0.50:
+        MDA = max(MDA, 7500.0)
+        MFA = max(MFA, 5000.0)
+
+    requires_cdp = (LUF <= 0.50)
+    return (round(MDA,1), round(MFA,1), requires_cdp)

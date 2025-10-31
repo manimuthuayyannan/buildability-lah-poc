@@ -1,17 +1,19 @@
-FT_PER_M   = 3.28084
-FT2_PER_M2 = FT_PER_M**2
+# Units
+FT2_PER_M2 = 10.763910416709722
 ACRES_PER_FT2 = 1.0 / 43560.0
 
-SR = 102100  # Web Mercator
+# Default interval shown in CLI help (the code auto-detects 5 vs 10 from LAYER)
+DEFAULT_CONTOUR_INTERVAL_FT = 5.0  # informational; actual value is picked from LAYER
 
-# ArcGIS services
-PARCEL_LAYER  = "https://mapservices.sccgov.org/arcgis/rest/services/property/SCCProperty/MapServer/0"
-CONTOUR_LAYER = "https://mapservices.sccgov.org/arcgis/rest/services/basic/SCCContour/MapServer/0"
-DEM_IMAGE     = "https://mapservices.sccgov.org/arcgis/rest/services/lidar/BareEarth_DEM_HydroFlattened_2020/ImageServer"
+# Services (Santa Clara County)
+SCC_BASE = "https://mapservices.sccgov.org/arcgis/rest/services"
+LAYER_PROPERTY = f"{SCC_BASE}/property/SCCProperty/MapServer/0"
+LAYER_CONTOUR  = f"{SCC_BASE}/basic/SCCContour/MapServer/0"
+GEOM_SVC       = f"{SCC_BASE}/Utilities/Geometry/GeometryServer"
 
-HEADERS = {"Referer": "https://geoess.sccgov.org"}
+# Spatial reference — feet
+SR_WKID = 2227  # NAD83 / California zone III (ftUS)
 
-DEFAULT_TIMEOUT = (10, 90)  # (connect, read) seconds – was 30s read before
-RETRY_TOTAL = 5
-RETRY_BACKOFF = 0.6  # 0.6, 1.2, 2.4, ...
-USER_AGENT = "LAH-POC/1.0 (+https://private-open-house)"
+# HTTP
+DEFAULT_TIMEOUT = 40  # seconds
+USER_AGENT = "buildability-lah/1.0"

@@ -1,12 +1,14 @@
 # app.py
-import os, sys, json, math, io, time
+import os, sys, json, math
 import pandas as pd
 import streamlit as st
 import requests
+import time
 
 # Ensure local package imports work when launched via `streamlit run app.py`
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 from buildability.cli import run_for_address, run_for_apn  # core logic
+
 
 # ------------------------ Page & Theme ------------------------
 st.set_page_config(
@@ -16,13 +18,10 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# Subtle CSS polish (glass header, metrics, badges, table)
+# ------------------------ Styling ------------------------
 st.markdown("""
 <style>
-/* Page width */
 .block-container {max-width: 980px;}
-
-/* Glass header */
 .glass {
   background: linear-gradient(180deg, rgba(255,255,255,.75), rgba(255,255,255,.45));
   backdrop-filter: blur(6px);
@@ -31,8 +30,6 @@ st.markdown("""
   padding: 18px 22px;
   box-shadow: 0 10px 30px rgba(0,0,0,.05);
 }
-
-/* Metric cards */
 .card {
   border-radius: 16px;
   padding: 16px 16px;
@@ -45,16 +42,12 @@ st.markdown("""
 .card p {
   margin: 2px 0 0; font-size: 26px; font-weight: 700; color: #0f172a;
 }
-
-/* Badges */
 .badge {
   display:inline-block; padding: 4px 10px; border-radius: 999px;
   font-size: 12px; font-weight: 600; border:1px solid rgba(0,0,0,.08);
 }
 .badge.ok { color:#0a7f22; background:rgba(10,127,34,.08); }
 .badge.warn { color:#a10; background:rgba(170,16,0,.08); }
-
-/* Detail table */
 .table {
   width:100%; border-collapse: collapse; border-radius:16px; overflow:hidden;
   border:1px solid rgba(210,210,210,.45);
@@ -64,44 +57,42 @@ st.markdown("""
 }
 .table thead th { background:#f6f8fb; color:#475569; font-weight:700; }
 .table tr:last-child td { border-bottom:none; }
-
-/* Footer note */
 .note { color:#475569; font-size:13px; }
 .small { color:#64748b; font-size:12px; }
+.kv { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size:12px; color:#334155;}
 </style>
 """, unsafe_allow_html=True)
 
 # ------------------------ Header ------------------------
 with st.container():
-    st.markdown(
-        """
-        <div class="glass">
-            <h1 style="margin:0 0 6px 0">🏡 Los Altos Hills Buildability Analyzer</h1>
-            <div class="small">Compute <b>Average Slope</b>, <b>LUF</b>, <b>MDA</b>, and <b>MFA</b> using live Santa Clara County GIS.</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.markdown("""
+    <div class="glass">
+        <h1 style="margin:0 0 6px 0">🏡 Los Altos Hills Buildability Analyzer</h1>
+        <div class="small">Compute <b>Average Slope</b>, <b>LUF</b>, <b>MDA</b>, and <b>MFA</b> using live Santa Clara County GIS.</div>
+    </div>
+    """, unsafe_allow_html=True)
 
-st.write("")  # spacing
+st.write("")
 
 # ------------------------ Controls ------------------------
 colA, colB = st.columns([1, 2])
 with colA:
     mode = st.radio("Search by", ["Address", "APN"], horizontal=True, label_visibility="collapsed")
 with colB:
-    placeholder = "27181 Adonna Ct, Los Altos Hills, CA" if mode == "Address" else "18204019"
+    placeholder = "24785 Prospect Ave, Los Altos Hills, CA" if mode == "Address" else "18204019"
     user_input = st.text_input("Input", placeholder, label_visibility="collapsed")
 
-c1, c2, c3 = st.columns([1,1,1])
+c1, c2, c3 = st.columns([1, 1, 1])
 with c1:
     ci = st.select_slider("Contour interval (ft)", options=[1.0, 2.0, 5.0, 10.0], value=2.0,
-                          help="LAH worksheet uses 2-ft contours. Change only for testing.")
+                          help="LAH worksheet uses 2-ft contours by default. Change only for testing.")
 with c2:
-    qa_samples = st.select_slider("DEM samples (QA only)", options=[64, 100, 144, 196, 225, 400], value=144,
+    qa_samples = st.select_slider("DEM samples (QA only)", options=[64, 100, 144, 196, 225, 400], value=64,
                                   help="Affects only DEM slope QA; smaller is faster.")
 with c3:
     run_btn = st.button("Analyze", type="primary", use_container_width=True)
+
+show_diag = st.toggle("Show diagnostics", value=False, help="Reveal raw data, intervals, and field mappings.")
 
 # ------------------------ Helpers ------------------------
 def fmt_num(x, decimals=1):
@@ -117,8 +108,8 @@ def build_rows(result: dict):
         ("Parcel Area (ft²)",          fmt_num(result["parcel_area_ft2"], 1)),
         ("Parcel Area (acres)",        fmt_num(result["parcel_area_acres"], 4)),
         ("Elevation Field",            str(result["contour_elevation_field"])),
-        ("2-ft Contour Count",         fmt_num(result["contour_2ft_count"], None)),
-        ("Total Contour Length (ft)",  fmt_num(result["contour_2ft_total_length_ft"], 1)),
+        ("Contour Count",              fmt_num(result["contour_count"], None)),
+        ("Total Contour Length (ft)",  fmt_num(result["contour_total_length_ft"], 1)),
         ("Average Slope (LAH, %)",     fmt_num(result["avg_slope_percent_LAH"], 2)),
         ("Lot Unit Factor (LUF)",      fmt_num(result["lot_unit_factor"], 6)),
         ("MDA (ft²)",                  fmt_num(result["mda_ft2"], 1)),
@@ -136,25 +127,21 @@ def render_detail_table(rows):
 
 def metrics_row(result):
     m1, m2, m3, m4 = st.columns(4)
-    m1.markdown('<div class="card"><h3>Avg Slope (LAH)</h3><p>'+fmt_num(result["avg_slope_percent_LAH"],2)+'%</p></div>', unsafe_allow_html=True)
-    m2.markdown('<div class="card"><h3>Lot Unit Factor</h3><p>'+fmt_num(result["lot_unit_factor"],6)+'</p></div>', unsafe_allow_html=True)
-    m3.markdown('<div class="card"><h3>MDA</h3><p>'+fmt_num(result["mda_ft2"],1)+' ft²</p></div>', unsafe_allow_html=True)
-    m4.markdown('<div class="card"><h3>MFA</h3><p>'+fmt_num(result["mfa_ft2"],1)+' ft²</p></div>', unsafe_allow_html=True)
+    m1.markdown(f"<div class='card'><h3>Avg Slope (LAH)</h3><p>{fmt_num(result['avg_slope_percent_LAH'],2)}%</p></div>", unsafe_allow_html=True)
+    m2.markdown(f"<div class='card'><h3>Lot Unit Factor</h3><p>{fmt_num(result['lot_unit_factor'],6)}</p></div>", unsafe_allow_html=True)
+    m3.markdown(f"<div class='card'><h3>MDA</h3><p>{fmt_num(result['mda_ft2'],1)} ft²</p></div>", unsafe_allow_html=True)
+    m4.markdown(f"<div class='card'><h3>MFA</h3><p>{fmt_num(result['mfa_ft2'],1)} ft²</p></div>", unsafe_allow_html=True)
 
 def download_buttons(result):
-    # JSON
     json_bytes = json.dumps(result, indent=2).encode("utf-8")
     st.download_button("⬇️ Download JSON", json_bytes, file_name=f"lah_buildability_{result['apn']}.json", mime="application/json")
-    # CSV (flatten the table-friendly view)
-    rows = build_rows(result)
-    df = pd.DataFrame(rows, columns=["Metric","Value"])
+    df = pd.DataFrame(build_rows(result), columns=["Metric","Value"])
     csv = df.to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ Download CSV", csv, file_name=f"lah_buildability_{result['apn']}.csv", mime="text/csv")
 
-# ------------------------ Caching ------------------------
+# ------------------------ Cached execution ------------------------
 @st.cache_data(show_spinner=False, ttl=600)
 def cached_run(mode: str, q: str, contour_interval_ft: float, qa_samples: int):
-    # We don’t pass qa_samples into your core (kept for future), but cache key includes it
     if mode == "APN":
         return run_for_apn(q, contour_interval_ft)
     return run_for_address(q, contour_interval_ft)
@@ -167,48 +154,64 @@ if run_btn:
 
     with st.spinner("Contacting County GIS services…"):
         try:
-            # Call cached core
             result = cached_run(mode, user_input.strip(), float(ci), int(qa_samples))
         except requests.exceptions.ReadTimeout:
-            st.error("⏳ The County GIS server took too long to respond. Try again or check your network.")
+            st.error("⏳ GIS server timeout. Try again later.")
             st.stop()
         except requests.exceptions.ConnectionError:
-            st.error("🌐 Network error reaching the County GIS server. Check connectivity/VPN and retry.")
+            st.error("🌐 Connection error to County GIS. Check network or VPN.")
             st.stop()
         except Exception as e:
             st.error(f"❌ Error: {e}")
             st.stop()
 
-    # ---------------- Summary badges ----------------
-    st.success("Analysis completed successfully.")
+    # ---------------- Results Display ----------------
+    st.success("✅ Analysis completed successfully.")
     badge = '<span class="badge ok">CDP Not Required</span>' if not result["requires_cdp"] else '<span class="badge warn">CDP Required</span>'
     st.markdown(badge, unsafe_allow_html=True)
-    st.write("")
 
-    # ---------------- Metrics ----------------
     metrics_row(result)
     st.write("")
 
-    # ---------------- Details ----------------
     with st.expander("Detailed Results", expanded=True):
         render_detail_table(build_rows(result))
-        st.write("")
         notes = result.get("notes", {})
         st.markdown(
             f"<div class='note'><b>Notes</b><br>"
-            f"• Contour interval: {notes.get('contour_interval_ft','—')} ft<br>"
+            f"• Interval (selected/detected/used): {notes.get('contour_interval_ft_selected','—')} / "
+            f"{notes.get('contour_interval_ft_detected','—')} / "
+            f"{notes.get('contour_interval_ft_used','—')} ft<br>"
             f"• CDP rule: {notes.get('cdp_rule','—')}<br>"
             f"• Disclaimer: {notes.get('disclaimer','—')}</div>",
-            unsafe_allow_html=True
+            unsafe_allow_html=True,
         )
 
-    # ---------------- Downloads ----------------
+    if show_diag:
+        st.markdown("### Diagnostics")
+        diag_cols = st.columns(2)
+        with diag_cols[0]:
+            st.markdown(
+                f"<div class='kv'>elev_field = <b>{result.get('contour_elevation_field')}</b><br>"
+                f"contour_count = <b>{result.get('contour_count')}</b><br>"
+                f"total_length_ft = <b>{fmt_num(result.get('contour_total_length_ft'),1)}</b><br>"
+                f"avg_slope_pct = <b>{fmt_num(result.get('avg_slope_percent_LAH'),2)}</b></div>",
+                unsafe_allow_html=True,
+            )
+        with diag_cols[1]:
+            st.markdown(
+                f"<div class='kv'>parcel_area_ft2 = <b>{fmt_num(result.get('parcel_area_ft2'),1)}</b><br>"
+                f"parcel_area_acres = <b>{fmt_num(result.get('parcel_area_acres'),4)}</b><br>"
+                f"DEM slope QA mean (%) = <b>{fmt_num(result.get('slope_percent_dem_QA_mean'),2)}</b></div>",
+                unsafe_allow_html=True,
+            )
+
     st.write("")
     download_buttons(result)
 
 # ------------------------ Footer ------------------------
 st.write("")
 st.markdown(
-    "<div class='small'>Built by <b>Private Open House Inc.</b> • LAH worksheet logic applied as per Town documentation. "
-    "Confirm final results with planning staff.</div>", unsafe_allow_html=True
+    "<div class='small'>Built by <b>Private Open House Inc.</b> • Logic mirrors the official Los Altos Hills worksheet. "
+    "Confirm results with planning staff.</div>",
+    unsafe_allow_html=True,
 )

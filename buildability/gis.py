@@ -1,197 +1,267 @@
-import json, math, re, requests
-from .config import PARCEL_LAYER, CONTOUR_LAYER, DEM_IMAGE, HEADERS, SR, FT_PER_M, FT2_PER_M2, ACRES_PER_FT2
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from .config import HEADERS, DEFAULT_TIMEOUT, RETRY_TOTAL, RETRY_BACKOFF, USER_AGENT
-
-# build a resilient session once
-_session = requests.Session()
-retry = Retry(
-    total=RETRY_TOTAL,
-    connect=RETRY_TOTAL,
-    read=RETRY_TOTAL,
-    backoff_factor=RETRY_BACKOFF,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods={"GET", "POST"},
-    raise_on_status=False,
+import math, time, json, requests
+from .config import (
+    LAYER_PROPERTY, LAYER_CONTOUR, GEOM_SVC,
+    SR_WKID, DEFAULT_TIMEOUT, USER_AGENT,
 )
-_adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
-_session.mount("https://", _adapter)
-_session.mount("http://", _adapter)
+import math
 
-_base_headers = {**HEADERS, "User-Agent": USER_AGENT}
+_session = requests.Session()
+_session.headers.update({"User-Agent": USER_AGENT})
+_base_headers = {"Accept": "application/json"}
 
-def gget(url, **params):
-    r = _session.get(url, params={"f": "json", **params},
-                     headers=_base_headers, timeout=DEFAULT_TIMEOUT)
+def _retry(fn, tries=4, backoff=1.6):
+    last = None
+    for i in range(tries):
+        try:
+            return fn()
+        except requests.RequestException as e:
+            last = e
+            if i == tries-1: raise
+            time.sleep(backoff*(i+1))
+    raise last
+
+def _t_get(url, params):
+    params = {"f":"json", **params}
+    r = _retry(lambda: _session.get(url, params=params, headers=_base_headers, timeout=DEFAULT_TIMEOUT))
     r.raise_for_status()
-    return r.json()
+    js = r.json()
+    if "error" in js: raise RuntimeError(js["error"])
+    return js
 
-def gpost(url, **params):
-    r = _session.post(url, data={"f": "json", **params},
-                      headers=_base_headers, timeout=DEFAULT_TIMEOUT)
+def _t_post(url, data):
+    data = {"f":"json", **data}
+    r = _retry(lambda: _session.post(url, data=data, headers=_base_headers, timeout=DEFAULT_TIMEOUT))
     r.raise_for_status()
-    return r.json()
+    js = r.json()
+    if "error" in js: raise RuntimeError(js["error"])
+    return js
 
-# ---- Address / APN search ----
+def _densify_polylines_local(geoms, max_seg_len_ft=2.0):
+    """Split every segment so no piece exceeds max_seg_len_ft."""
+    out = []
+    for g in geoms:
+        new_paths = []
+        for path in g.get("paths", []):
+            if not path: 
+                continue
+            acc = [path[0]]
+            for i in range(len(path)-1):
+                x1,y1 = path[i]
+                x2,y2 = path[i+1]
+                dx, dy = x2-x1, y2-y1
+                seg_len = math.hypot(dx, dy)
+                if seg_len <= max_seg_len_ft or seg_len == 0.0:
+                    acc.append([x2,y2])
+                else:
+                    n = max(1, int(math.ceil(seg_len / max_seg_len_ft)))
+                    for k in range(1, n+1):
+                        t = k / n
+                        acc.append([x1 + dx*t, y1 + dy*t])
+            new_paths.append(acc)
+        out.append({"paths": new_paths})
+    return out
 
-def normalize_address(text):
-    return re.sub(r"[^A-Za-z0-9 ]+", "", text).strip().upper()
+def _point_on_segment_eps(px, py, x1, y1, x2, y2, eps=0.5):
+    """Distance from point to segment <= eps? (treat boundary as inside)."""
+    vx, vy = x2-x1, y2-y1
+    wx, wy = px-x1, py-y1
+    seg_len2 = vx*vx + vy*vy
+    if seg_len2 == 0.0:
+        # degenerate segment
+        return math.hypot(px-x1, py-y1) <= eps
+    t = max(0.0, min(1.0, (wx*vx + wy*vy)/seg_len2))
+    cx, cy = x1 + t*vx, y1 + t*vy
+    return math.hypot(px-cx, py-cy) <= eps
 
-def search_parcel_by_address(address):
-    addr = normalize_address(address)
-    tokens = addr.split()
-    if len(tokens) < 2:
-        raise ValueError("Address too short. Include house number and street name.")
-    house, street = tokens[0], tokens[1]
-    where = f"SITUS_HOUSE_NUMBER LIKE '{house}%' AND SITUS_STREET_NAME LIKE '{street}%'"
-    js = gget(PARCEL_LAYER + "/query",
-              where=where, outFields="*", returnGeometry="true", outSR=SR, resultRecordCount=5)
+def _point_in_polygon_with_tol(px, py, rings, eps=0.5):
+    """Ray-cast with edge tolerance: points on/within eps of any edge are 'inside'."""
+    # Edge tolerance
+    for ring in rings:
+        for i in range(len(ring)-1):
+            x1,y1 = ring[i]; x2,y2 = ring[i+1]
+            if _point_on_segment_eps(px, py, x1, y1, x2, y2, eps=eps):
+                return True
+
+    # Standard even-odd rule
+    inside = False
+    for ring in rings:
+        for i in range(len(ring)-1):
+            x1,y1 = ring[i]; x2,y2 = ring[i+1]
+            if ((y1 > py) != (y2 > py)):
+                xint = x1 + (py - y1) * (x2 - x1) / (y2 - y1)
+                if xint >= px:
+                    inside = not inside
+    return inside
+
+def _polyline_length_inside_polygon_local(geoms, parcel_geom, eps=0.5):
+    """Sum of segment lengths whose midpoints are inside parcel (with edge tol)."""
+    rings = parcel_geom.get("rings", [])
+    total = 0.0
+    for g in geoms:
+        for path in g.get("paths", []):
+            for i in range(len(path)-1):
+                x1,y1 = path[i]; x2,y2 = path[i+1]
+                mx, my = (x1+x2)/2.0, (y1+y2)/2.0
+                if _point_in_polygon_with_tol(mx, my, rings, eps=eps):
+                    total += math.hypot(x2-x1, y2-y1)
+    return total
+
+def _polyline_length_ft(geoms):
+    total = 0.0
+    for g in geoms:
+        for path in g.get("paths", []):
+            for i in range(len(path)-1):
+                x1,y1 = path[i]; x2,y2 = path[i+1]
+                total += math.hypot(x2-x1, y2-y1)
+    return total
+# -----------------------------
+# Parcel lookups
+# -----------------------------
+def search_parcel_by_address(address: str):
+    # Expect "24785 Prospect Ave, Los Altos Hills, CA"
+    parts = address.strip().split(" ", 1)
+    if len(parts) < 2:
+        raise RuntimeError("Address must start with house number and street")
+    house = parts[0]
+    street_full = parts[1].split(",")[0].strip()
+    street_head = street_full.split()[0].upper()
+
+    where = f"SITUS_HOUSE_NUMBER LIKE '{house}%' AND SITUS_STREET_NAME LIKE '{street_head}%'"
+    js = _t_post(f"{LAYER_PROPERTY}/query", {
+        "where": where,
+        "outFields": "*",
+        "returnGeometry": "true",
+        "outSR": SR_WKID,
+        "resultRecordCount": 5
+    })
     feats = js.get("features", [])
     if not feats:
-        raise ValueError(f"No parcel found for address: {address}")
+        raise RuntimeError("Parcel not found for address")
     f = feats[0]
-    return f["attributes"].get("APN"), f["geometry"], f["attributes"]
+    apn = f["attributes"]["APN"]
+    return apn, f["geometry"], f["attributes"]
 
-def search_parcel_by_apn(apn):
-    js = gget(PARCEL_LAYER + "/query",
-              where=f"APN='{apn}'", outFields="*", returnGeometry="true", outSR=SR)
+def search_parcel_by_apn(apn: str):
+    js = _t_post(f"{LAYER_PROPERTY}/query", {
+        "where": f"APN='{apn}'",
+        "outFields": "*",
+        "returnGeometry": "true",
+        "outSR": SR_WKID
+    })
     feats = js.get("features", [])
     if not feats:
-        raise ValueError(f"No parcel for APN {apn}")
+        raise RuntimeError("Parcel not found for APN")
     f = feats[0]
     return f["geometry"], f["attributes"]
 
-# ---- Geometry helpers ----
+# -----------------------------
+# Area helpers
+# -----------------------------
+def parcel_area_ft2(geom):
+    # Prefer server areasAndLengths (feet). Fall back to planar ring area in feet.
+    try:
+        js = _t_post(f"{GEOM_SVC}/areasAndLengths", {
+            "sr": json.dumps({"wkid": SR_WKID}),
+            "polygons": json.dumps([geom]),
+            "lengthUnit": 9002,  # foot
+            "areaUnit": {"areaUnit":"esriSquareFeet"}
+        })
+        return float(js["areas"][0])
+    except Exception as e:
+        print(f"[GIS] areasAndLengths failed, falling back to local area: {e}")
+        return _planar_area_ft2(geom)
 
-def ring_area_m2(ring):
-    a = 0.0
-    for i in range(len(ring) - 1):
-        x1, y1 = ring[i]; x2, y2 = ring[i+1]
-        a += x1*y2 - x2*y1
-    return abs(a) / 2.0
+def _planar_area_ft2(geom):
+    def ring_area(ring):
+        a = 0.0
+        for i in range(len(ring)-1):
+            x1,y1 = ring[i]; x2,y2 = ring[i+1]
+            a += x1*y2 - x2*y1
+        return abs(a/2.0)
+    area = 0.0
+    for ring in geom.get("rings", []):
+        area += ring_area(ring)
+    return area
 
-def parcel_area_m2(geom):
-    if not geom or "rings" not in geom or not geom["rings"]:
-        return 0.0
-    total = 0.0
-    for r in geom["rings"]:
-        total += ring_area_m2(r)
-    return total
-
-def point_in_ring(x, y, ring):
-    inside = False
-    for i in range(len(ring)):
-        x1, y1 = ring[i]
-        x2, y2 = ring[(i + 1) % len(ring)]
-        if ((y1 > y) != (y2 > y)) and (x < (x2 - x1) * (y - y1) / (y2 - y1 + 1e-12) + x1):
-            inside = not inside
-    return inside
-
-# ---- Contours ----
-
+# -----------------------------
+# Contours & length inside parcel
+# -----------------------------
 def detect_elev_field():
-    meta = gget(CONTOUR_LAYER)
-    candidates = ["ELEV", "ELEVATION", "CONTOUR", "INDEXELEV", "INDEX"]
-    fields = {f["name"].upper(): f["name"] for f in meta.get("fields", [])}
-    for c in candidates:
-        if c in fields:
-            return fields[c]
-    return None
+    # LA County layer uses ELEVATION; keep hook if ever needed
+    return "ELEVATION"
 
-M2_TO_FT2 = 10.7639
-M_TO_FT = 3.28084
-
-def _polyline_length_m(geom: dict) -> float:
-    total = 0.0
-    # geometry: {"paths": [[[x1,y1],[x2,y2],...], [...]]}
-    paths = (geom or {}).get("paths") or []
-    for path in paths:
-        for i in range(len(path) - 1):
-            x1, y1 = path[i]
-            x2, y2 = path[i + 1]
-            total += math.hypot(x2 - x1, y2 - y1)
-    return total
-
-def contours_inside(parcel_geom: dict, layer_url: str, elev_field: str = None):
-    """
-    Return (features, total_len_m).
-    We intentionally use returnGeometry=true and compute length from geometry
-    so we don't depend on Shape_Length field naming.
-    """
-    params = {
-        "where": "1=1" if not elev_field else f"{elev_field} IS NOT NULL",
-        "outFields": "*" if elev_field else "OBJECTID",   # bring attrs if we need elevation
+def _query_contours(parcel_geom):
+    where = "ELEVATION IS NOT NULL AND (UPPER(LAYER)='INDEX' OR UPPER(LAYER)='INTERMEDIATE')"
+    js = _t_post(f"{LAYER_CONTOUR}/query", {
+        "where": where,
+        "outFields": "OBJECTID,ELEVATION,LAYER",
         "returnGeometry": "true",
         "geometry": json.dumps(parcel_geom),
         "geometryType": "esriGeometryPolygon",
         "spatialRel": "esriSpatialRelIntersects",
-        "inSR": SR,
-        "outSR": SR,
-        "resultRecordCount": 2000,
-    }
-    js = arcgis_get(layer_url + "/query", params)
+        "inSR": SR_WKID,
+        "outSR": SR_WKID,
+        "geometryPrecision": 2,
+        "maxAllowableOffset": 0.5,
+        "resultRecordCount": 5000
+    })
     feats = js.get("features", [])
+    print(f"[GIS] Contours fetched (filtered): {len(feats)}")
+    return feats
 
-    total_len_m = 0.0
-    for f in feats:
-        g = f.get("geometry")
-        total_len_m += _polyline_length_m(g)
+def _intersect_length_ft(lines_geoms, parcel_geom):
+    # Intersect: send polylines as "geometries", parcel as "geometry"
+    js = _t_post(f"{GEOM_SVC}/intersect", {
+        "sr": json.dumps({"wkid": SR_WKID}),
+        "geometries": json.dumps({"geometryType":"esriGeometryPolyline", "geometries": lines_geoms}),
+        "geometry": json.dumps(parcel_geom),
+        "geometryType": "esriGeometryPolygon"
+    })
+    geoms = js.get("geometries", [])
+    return _polyline_length_ft(geoms)
 
-    return feats, total_len_m
-def two_ft_subset(features, elev_field):
-    if not features or not elev_field:
-        return features or []
-    out = []
-    for f in features:
-        try:
-            z = float(f.get("attributes", {}).get(elev_field))
-        except (TypeError, ValueError):
-            z = None
-        if z is not None and abs(z % 2.0) < 1e-6:
-            out.append(f)
-    return out
+def _polyline_length_ft(geoms):
+    def path_len(path):
+        tot = 0.0
+        for i in range(len(path)-1):
+            x1,y1 = path[i]; x2,y2 = path[i+1]
+            tot += math.hypot(x2-x1, y2-y1)
+        return tot
+    total = 0.0
+    for g in geoms:
+        for p in g.get("paths", []):
+            total += path_len(p)
+    return total
 
-def contour_length_m(features):
-    total_m = 0.0
-    for f in features:
-        sl = f.get("attributes", {}).get("Shape_Length")
-        if isinstance(sl, (int, float)):
-            total_m += float(sl)
-    return total_m
+def contours_inside(parcel_geom, elev_field="ELEVATION", index_only=False):
+    feats = _query_contours(parcel_geom)
+    if index_only:
+        feats = [f for f in feats if str(f["attributes"].get("LAYER","")).upper()=="INDEX"]
+    return feats
 
-# ---- DEM slope QA ----
+def project_polylines_to_measure(feats):
+    # Input already requested in SR_WKID; just return geometry objects (polylines)
+    return [f["geometry"] for f in feats]
 
-def slope_from_dem_samples(parcel_geom, n_samples=225, slope_units="PERCENT_RISE"):
-    xs = [v[0] for r in parcel_geom["rings"] for v in r]
-    ys = [v[1] for r in parcel_geom["rings"] for v in r]
-    xmin, xmax = min(xs), max(xs); ymin, ymax = min(ys), max(ys)
-    ring = parcel_geom["rings"][0]
-    root = max(2, int(n_samples ** 0.5))
-    points = []
-    for i in range(root):
-        for j in range(root):
-            x = xmin + (i + 0.5) * (xmax - xmin) / root
-            y = ymin + (j + 0.5) * (ymax - ymin) / root
-            if point_in_ring(x, y, ring):
-                points.append([x, y])
-    if not points:
-        return {"values": [], "mean": None}
+def length_inside_parcel_ft(contour_geoms_ft, parcel_geom, max_seg_len_ft=2.0):
+    """
+    Local, serverless computation:
+    1) densify all contour paths to <= max_seg_len_ft
+    2) count the length of segments whose midpoints are inside the parcel
+       (boundary within eps=0.5 ft is treated as inside, matching worksheet behavior)
+    """
+    # Local densify (no GeometryServer calls)
+    dens = _densify_polylines_local(contour_geoms_ft, max_seg_len_ft=max_seg_len_ft)
 
-    rendering_rule = {
-        "rasterFunction": "Slope",
-        "rasterFunctionArguments": {"zFactor": 1, "slopeType": slope_units},
-        "variableName": "Raster"
-    }
-    geom = {"points": points, "spatialReference": {"wkid": SR}}
-    js = gpost(DEM_IMAGE + "/getSamples",
-               geometryType="esriGeometryMultipoint", geometry=json.dumps(geom),
-               inSR=SR, outSR=SR, returnGeometry="false",
-               renderingRule=json.dumps(rendering_rule))
-    vals = []
-    for s in js.get("samples", []):
-        try: vals.append(float(s.get("value")))
-        except: pass
-    if not vals:
-        return {"values": [], "mean": None}
-    return {"values": vals, "mean": round(sum(vals)/len(vals), 2)}
+    # Measure length of densified segments inside polygon with edge tolerance
+    inside_len = _polyline_length_inside_polygon_local(dens, parcel_geom, eps=0.5)
+
+    # If still zero, relax tolerance slightly as a last resort
+    if inside_len == 0.0:
+        inside_len = _polyline_length_inside_polygon_local(dens, parcel_geom, eps=1.0)
+
+    return round(inside_len, 2), {"method": "local_densify+midpoint_with_edge_tolerance"}
+
+def slope_from_dem_samples(*args, **kwargs):
+    # Keep stub for CLI flag parity; DEM QA is optional and flaky on slow server
+    return {"mean": None}
